@@ -19,12 +19,14 @@ from collections.abc import (
     Awaitable,
     Callable,
     Collection,
+    Coroutine as CoroutineABC,
     Generator,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
+from dataclasses import dataclass
 from types import AsyncGeneratorType, CoroutineType
 from typing import (
     TYPE_CHECKING,
@@ -328,7 +330,7 @@ def pytest_report_header(config: Config) -> list[str]:
 
 
 def _fixture_synchronizer(
-    fixturedef: FixtureDef, runner: Runner, request: FixtureRequest
+    fixturedef: FixtureDef, runner: _PytestAsyncioRunner, request: FixtureRequest
 ) -> Callable:
     """Returns a synchronous function evaluating the specified fixture."""
     fixture_function = resolve_fixture_function(fixturedef, request)
@@ -350,7 +352,7 @@ def _wrap_syncgen_fixture(
     fixture_function: Callable[
         SyncGenFixtureParams, Generator[SyncGenFixtureYieldType]
     ],
-    runner: Runner,
+    runner: _PytestAsyncioRunner,
 ) -> Callable[SyncGenFixtureParams, Generator[SyncGenFixtureYieldType]]:
     @functools.wraps(fixture_function)
     def _syncgen_fixture_wrapper(
@@ -369,7 +371,7 @@ SyncFixtureReturnType = TypeVar("SyncFixtureReturnType")
 
 def _wrap_sync_fixture(
     fixture_function: Callable[SyncFixtureParams, SyncFixtureReturnType],
-    runner: Runner,
+    runner: _PytestAsyncioRunner,
 ) -> Callable[SyncFixtureParams, SyncFixtureReturnType]:
     @functools.wraps(fixture_function)
     def _sync_fixture_wrapper(
@@ -390,7 +392,7 @@ def _wrap_asyncgen_fixture(
     fixture_function: Callable[
         AsyncGenFixtureParams, AsyncGeneratorType[AsyncGenFixtureYieldType, Any]
     ],
-    runner: Runner,
+    runner: _PytestAsyncioRunner,
     request: FixtureRequest,
 ) -> Callable[AsyncGenFixtureParams, AsyncGenFixtureYieldType]:
     @functools.wraps(fixture_function)
@@ -440,7 +442,7 @@ def _wrap_async_fixture(
     fixture_function: Callable[
         AsyncFixtureParams, CoroutineType[Any, Any, AsyncFixtureReturnType]
     ],
-    runner: Runner,
+    runner: _PytestAsyncioRunner,
     request: FixtureRequest,
 ) -> Callable[AsyncFixtureParams, AsyncFixtureReturnType]:
     @functools.wraps(fixture_function)
@@ -890,9 +892,78 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     return None
 
 
+RunResult = TypeVar("RunResult")
+
+
+@dataclass
+class _RunnerInvocation:
+    failure: BaseException | None = None
+    task: asyncio.Task[Any] | None = None
+
+
+class _PytestAsyncioRunner:
+    """Propagate pytest.fail/xfail outcomes reported by asyncio callbacks."""
+
+    def __init__(self, runner: Runner) -> None:
+        self._runner = runner
+        self._invocation: _RunnerInvocation | None = None
+        loop = runner.get_loop()
+        previous_handler = loop.get_exception_handler()
+
+        def exception_handler(loop: AbstractEventLoop, details: dict[str, Any]) -> None:
+            invocation = self._invocation
+            exception = details.get("exception")
+            if invocation is not None and isinstance(exception, pytest.fail.Exception):
+                if invocation.failure is None:
+                    invocation.failure = exception
+                    if invocation.task is not None:
+                        invocation.task.cancel()
+            elif previous_handler is None:
+                loop.default_exception_handler(details)
+            else:
+                previous_handler(loop, details)
+
+        # Fixtures can save and restore this handler across runner invocations.
+        # Keep it stable, and resolve the active invocation when it is called.
+        loop.set_exception_handler(exception_handler)
+
+    def get_loop(self) -> AbstractEventLoop:
+        return self._runner.get_loop()
+
+    def run(
+        self,
+        coro: CoroutineABC[Any, Any, RunResult],
+        *,
+        context: contextvars.Context | None = None,
+    ) -> RunResult:
+        invocation = _RunnerInvocation()
+
+        async def run() -> RunResult:
+            invocation.task = asyncio.current_task()
+            if invocation.failure is not None:
+                # An already-queued callback can fail before this task starts.
+                coro.close()
+                raise invocation.failure
+            return await coro
+
+        self._invocation = invocation
+        try:
+            try:
+                result = self._runner.run(run(), context=context)
+            except asyncio.CancelledError:
+                if invocation.failure is not None:
+                    raise invocation.failure from None
+                raise
+            if invocation.failure is not None:
+                raise invocation.failure
+            return result
+        finally:
+            self._invocation = None
+
+
 def _synchronize_coroutine(
     func: Callable[..., CoroutineType],
-    runner: asyncio.Runner,
+    runner: _PytestAsyncioRunner,
     context: contextvars.Context,
 ):
     """
@@ -1030,7 +1101,7 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
         event_loop_policy,
         _asyncio_loop_factory,
         request: FixtureRequest,
-    ) -> Iterator[Runner]:
+    ) -> Iterator[_PytestAsyncioRunner]:
         new_loop_policy = event_loop_policy
         debug_mode = _get_asyncio_debug(request.config)
         with _temporary_event_loop_policy(new_loop_policy):
@@ -1041,7 +1112,7 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
             if _asyncio_loop_factory is not None:
                 _set_event_loop(runner.get_loop())
             try:
-                yield runner
+                yield _PytestAsyncioRunner(runner)
             except Exception as e:
                 runner.__exit__(type(e), e, e.__traceback__)
             else:

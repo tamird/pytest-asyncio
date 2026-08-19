@@ -1,0 +1,1 @@
+Propagate ``pytest.fail()`` and ``pytest.xfail()`` from event-loop callbacks to the active asynchronous test or fixture.
