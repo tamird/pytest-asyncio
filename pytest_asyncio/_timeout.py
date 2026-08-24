@@ -43,12 +43,9 @@ _RUNNER_STATE = pytest.StashKey[_RunnerState]()
 _T = TypeVar("_T")
 
 
-def configure(config: pytest.Config) -> None:
-    if sys.version_info < (3, 11):
-        return
-    if not config.hook.pytest_timeout_expired.has_spec():
-        return
-    config.stash[_RUNNER_STATE] = _RunnerState()
+def _supports_cooperative_timeouts(config: pytest.Config) -> bool:
+    # Test modules can load pytest-timeout after pytest_configure has run.
+    return sys.version_info >= (3, 11) and config.hook.pytest_timeout_expired.has_spec()
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
@@ -71,7 +68,7 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
 @contextlib.contextmanager
 def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
     __tracebackhide__ = True
-    state = config.stash[_RUNNER_STATE]
+    state = config.stash.setdefault(_RUNNER_STATE, _RunnerState())
     previous = state.invocation
     state.invocation = invocation
     try:
@@ -105,7 +102,9 @@ def run(
     config: pytest.Config,
 ) -> _T:
     __tracebackhide__ = True
-    if _RUNNER_STATE not in config.stash or not isinstance(coro, CoroutineType):
+    if not _supports_cooperative_timeouts(config) or not isinstance(
+        coro, CoroutineType
+    ):
         return runner.run(coro, context=context)
 
     invocation = _Delivery(runner.get_loop())
@@ -147,7 +146,7 @@ def run(
 
 def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
     __tracebackhide__ = True
-    if _RUNNER_STATE not in config.stash:
+    if not _supports_cooperative_timeouts(config):
         runner.close()
         return
     with _deliver(config, _Delivery(runner.get_loop(), closing=True)):

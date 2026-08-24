@@ -56,7 +56,6 @@ from pytest import (
 
 from ._timeout import (
     close as _close_with_timeout,
-    configure as _configure_timeouts,
     pytest_timeout_expired as pytest_timeout_expired,
     run as _run_with_timeout,
 )
@@ -301,7 +300,6 @@ def _validate_scope(scope: str | None, option_name: str) -> None:
 
 
 def pytest_configure(config: Config) -> None:
-    _configure_timeouts(config)
     default_fixture_loop_scope = config.getini("asyncio_default_fixture_loop_scope")
     _validate_scope(default_fixture_loop_scope, "asyncio_default_fixture_loop_scope")
     if not default_fixture_loop_scope:

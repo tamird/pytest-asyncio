@@ -222,7 +222,7 @@ def test_runner_timeout_delivery(pytester: Pytester, cooperative_timeout: None):
 
 
 def test_signal_timeout_preserves_shared_loop(
-    pytester: Pytester, cooperative_timeout: None
+    pytester: Pytester, cooperative_timeout: None, monkeypatch: pytest.MonkeyPatch
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
@@ -230,6 +230,8 @@ def test_signal_timeout_preserves_shared_loop(
         import signal
         import time
         import pytest
+
+        pytest_plugins = "pytest_timeout"
 
         cleaned = []
 
@@ -279,7 +281,10 @@ def test_signal_timeout_preserves_shared_loop(
             with pytest.raises(pytest.fail.Exception, match="Timeout"):
                 signal.raise_signal(signal.SIGALRM)
         """))
-    result = pytester.runpytest_subprocess("--tb=short", timeout=10)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    result = pytester.runpytest_subprocess(
+        "-p", "pytest_asyncio.plugin", "--tb=short", timeout=10
+    )
     result.assert_outcomes(failed=2, passed=2)
     result.stdout.fnmatch_lines(["E *Failed: Timeout*from pytest-timeout.*"] * 2)
     result.stdout.fnmatch_lines(["*in application_wait*", "*CancelledError*"])
