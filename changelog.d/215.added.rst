@@ -1,1 +1,1 @@
-Add opt-in cooperative delivery of pytest-timeout signal failures in asynchronous tests and fixtures.
+Automatically deliver pytest-timeout signal failures cooperatively in asynchronous tests and fixtures on Python 3.11 and newer when pytest-timeout provides its expiry hook.

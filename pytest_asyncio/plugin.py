@@ -130,11 +130,6 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
         default=None,
         help="enable asyncio debug mode for the default event loop",
     )
-    group.addoption(
-        "--asyncio-cooperative-timeouts",
-        action="store_true",
-        help="deliver pytest-timeout signal failures by cancelling the active task",
-    )
     parser.addini(
         "asyncio_mode",
         help="default value for --asyncio-mode",
@@ -145,12 +140,6 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
         help="enable asyncio debug mode for the default event loop",
         type="bool",
         default="false",
-    )
-    parser.addini(
-        "asyncio_cooperative_timeouts",
-        help="default value for --asyncio-cooperative-timeouts",
-        type="bool",
-        default=False,
     )
     parser.addini(
         "asyncio_default_fixture_loop_scope",

@@ -18,14 +18,17 @@ def timeout_plugin(request: pytest.FixtureRequest):
         pytest.skip("requires pytest-timeout's signal-expiry hook")
 
 
+@pytest.fixture
+def cooperative_timeout(timeout_plugin: None):
+    if sys.version_info < (3, 11):
+        pytest.skip("cooperative timeouts require Python 3.11 or newer")
+
+
 @pytest.mark.parametrize("startup", ["timeout", "error"])
 def test_timeout_before_task_start(
-    pytester: Pytester, startup: str, timeout_plugin: None
+    pytester: Pytester, startup: str, cooperative_timeout: None
 ):
-    pytester.makeini(
-        "[pytest]\nasyncio_default_fixture_loop_scope = function\n"
-        "asyncio_cooperative_timeouts = true"
-    )
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makeconftest(dedent("""\
         import pytest
 
@@ -93,12 +96,9 @@ def test_timeout_before_task_start(
 
 @pytest.mark.parametrize("trigger", ["timer", "reschedule"])
 def test_signal_timeout_preserves_shared_loop(
-    pytester: Pytester, trigger: str, timeout_plugin: None
+    pytester: Pytester, trigger: str, cooperative_timeout: None
 ):
-    pytester.makeini(
-        "[pytest]\nasyncio_default_fixture_loop_scope = function\n"
-        f"asyncio_cooperative_timeouts = {trigger == 'timer'}"
-    )
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import signal
@@ -145,62 +145,44 @@ def test_signal_timeout_preserves_shared_loop(
             with pytest.raises(pytest.fail.Exception, match="Timeout"):
                 signal.raise_signal(signal.SIGALRM)
         """))
-    args = ["--tb=short"]
-    if trigger == "reschedule":
-        args.append("--asyncio-cooperative-timeouts")
-    result = pytester.runpytest_subprocess(*args, timeout=10)
+    result = pytester.runpytest_subprocess("--tb=short", timeout=10)
     result.assert_outcomes(failed=1, passed=2)
     result.stdout.fnmatch_lines(["*Failed: Timeout*from pytest-timeout.*"])
     if trigger == "timer":
         result.stdout.fnmatch_lines(["*in application_wait*", "*CancelledError*"])
+    assert "_timeout.py" not in result.stdout.str()
 
 
 @pytest.mark.parametrize(
     "cleanup",
-    [
-        "return",
-        "xfail",
-        "error",
-        "interrupt",
-        "exit",
-        pytest.param(
-            "native_interrupt",
-            marks=pytest.mark.skipif(
-                sys.version_info >= (3, 11),
-                reason="native tasks have cancellation counters on Python 3.11+",
-            ),
-        ),
-    ],
+    ["return", "xfail", "error", "interrupt", "exit", "system_exit", "cancel"],
 )
 def test_timeout_preserves_process_control(
-    pytester: Pytester, cleanup: str, timeout_plugin: None
+    pytester: Pytester, cleanup: str, cooperative_timeout: None
 ):
-    pytester.makeini(
-        "[pytest]\nasyncio_default_fixture_loop_scope = function\n"
-        "asyncio_cooperative_timeouts = true"
-    )
-    if cleanup == "native_interrupt":
-        pytester.makeconftest(dedent("""\
-            import asyncio
-            import pytest
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(f"""\
+        import asyncio
+        import pytest
 
-            NativeTask = asyncio.Task
+        failures = []
 
-            def loop_factory():
-                loop = asyncio.new_event_loop()
-                loop.set_task_factory(lambda loop, coro: NativeTask(coro, loop=loop))
-                return loop
+        @pytest.hookimpl(wrapper=True)
+        def pytest_timeout_expired(item, exception):
+            failures.append(exception)
+            return (yield)
 
-            def pytest_asyncio_loop_factories(config, item):
-                return {"native": loop_factory}
-
-            def pytest_runtest_makereport(item, call):
-                if call.when == "call":
-                    error = call.excinfo.value
+        def pytest_runtest_makereport(item, call):
+            if call.when == "call":
+                error = call.excinfo.value
+                if {cleanup!r} == "cancel":
                     assert isinstance(error, asyncio.CancelledError)
-                    assert isinstance(error.__cause__, pytest.fail.Exception)
-                    assert "Timeout" in str(error.__cause__)
-            """))
+                    assert error.__cause__ is failures[0]
+                elif {cleanup!r} == "system_exit":
+                    assert isinstance(error, SystemExit) and error.code == 7
+                else:
+                    assert error is failures[0]
+        """))
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import signal
@@ -222,7 +204,12 @@ def test_timeout_preserves_process_control(
                     raise ValueError("cleanup error")
                 if {cleanup!r} == "exit":
                     pytest.exit("requested exit", returncode=4)
-                signal.raise_signal(signal.SIGINT)
+                if {cleanup!r} == "system_exit":
+                    raise SystemExit(7)
+                if {cleanup!r} == "cancel":
+                    asyncio.current_task().cancel()
+                else:
+                    signal.raise_signal(signal.SIGINT)
                 await asyncio.sleep(0)
         """))
     result = pytester.runpytest_subprocess(timeout=10)
@@ -232,7 +219,10 @@ def test_timeout_preserves_process_control(
     elif cleanup == "exit":
         assert result.ret == pytest.ExitCode.USAGE_ERROR
         result.stdout.fnmatch_lines(["*Exit: requested exit*"])
-    elif cleanup == "native_interrupt":
+    elif cleanup == "system_exit":
+        result.assert_outcomes(failed=1)
+        result.stdout.fnmatch_lines(["*SystemExit: 7*"])
+    elif cleanup == "cancel":
         result.assert_outcomes(failed=1)
         result.stdout.fnmatch_lines(["*Failed: Timeout*", "*CancelledError*"])
     else:
@@ -241,20 +231,28 @@ def test_timeout_preserves_process_control(
 
 
 @pytest.mark.parametrize(
-    "phase", ["coroutine_setup", "generator_setup", "teardown", "shutdown"]
+    "phase",
+    ["coroutine_setup", "generator_setup", "teardown", "shutdown", "shutdown_boundary"],
 )
 def test_timeout_during_async_cleanup(
-    pytester: Pytester, phase: str, timeout_plugin: None
+    pytester: Pytester, phase: str, cooperative_timeout: None
 ):
-    pytester.makeini(
-        "[pytest]\nasyncio_default_fixture_loop_scope = function\n"
-        "asyncio_cooperative_timeouts = true"
-    )
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import signal
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
         import pytest
         import pytest_asyncio
+
+        executor = None
+        release = threading.Event()
+        finished = threading.Event()
+
+        def worker():
+            release.wait(5)
+            finished.set()
 
         async def timeout():
             asyncio.get_running_loop().call_soon(signal.raise_signal, signal.SIGALRM)
@@ -282,19 +280,38 @@ def test_timeout_during_async_cleanup(
         @pytest.mark.timeout(10, method="signal")
         @pytest.mark.asyncio
         async def test_timeout(coroutine, fixture):
+            global executor
             if {phase!r} == "shutdown":
                 asyncio.create_task(background())
                 await asyncio.sleep(0)
+            if {phase!r} == "shutdown_boundary":
+                loop = asyncio.get_running_loop()
+                executor = ThreadPoolExecutor()
+                loop.set_default_executor(executor)
+                loop.run_in_executor(None, worker)
+                original = loop.shutdown_asyncgens
+
+                async def shutdown_asyncgens():
+                    await original()
+                    signal.raise_signal(signal.SIGALRM)
+
+                loop.shutdown_asyncgens = shutdown_asyncgens
 
         def test_later():
-            pass
+            if executor is not None:
+                try:
+                    assert not finished.is_set()
+                finally:
+                    release.set()
+                    executor.shutdown(wait=True)
         """))
     result = pytester.runpytest_subprocess(timeout=10)
     result.assert_outcomes(errors=1, passed=1 if phase.endswith("setup") else 2)
     result.stdout.fnmatch_lines(["*Failed: Timeout*from pytest-timeout.*"])
 
 
-def test_cooperative_timeout_is_opt_in(pytester: Pytester, timeout_plugin: None):
+@pytest.mark.skipif(sys.version_info >= (3, 11), reason="legacy Python 3.10 behavior")
+def test_signal_timeout_on_python310(pytester: Pytester, timeout_plugin: None):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import signal
@@ -310,11 +327,15 @@ def test_cooperative_timeout_is_opt_in(pytester: Pytester, timeout_plugin: None)
     result.assert_outcomes(passed=1)
 
 
-def test_cooperative_timeout_requires_plugin(pytester: Pytester):
-    result = pytester.runpytest_subprocess(
-        "-p", "no:timeout", "--asyncio-cooperative-timeouts", timeout=10
-    )
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(
-        ["*asyncio_cooperative_timeouts requires pytest-timeout*"]
-    )
+def test_asyncio_without_timeout_plugin(pytester: Pytester):
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.mark.asyncio
+        async def test_asyncio():
+            await asyncio.sleep(0)
+        """))
+    result = pytester.runpytest_subprocess("-p", "no:timeout", timeout=10)
+    result.assert_outcomes(passed=1)

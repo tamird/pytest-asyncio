@@ -28,7 +28,6 @@ class _Delivery:
     loop: asyncio.AbstractEventLoop
     exception: BaseException | None = None
     handle: asyncio.Handle | None = None
-    timeout_cancellation: bool = False
 
     def interrupt(self, state: _RunnerState) -> None:
         raise NotImplementedError
@@ -36,13 +35,13 @@ class _Delivery:
 
 @dataclass
 class _Invocation(_Delivery):
-    task: asyncio.Task[Any] | None = None
-    cancellation_requested: bool = False
+    timeout: asyncio.Timeout | None = None
+    started: bool = False
 
     def interrupt(self, state: _RunnerState) -> None:
         self.handle = None
-        if state.invocation is self and self.task is not None:
-            self.cancellation_requested = self.task.cancel()
+        if state.invocation is self and self.timeout is not None:
+            self.timeout.reschedule(self.loop.time())
 
 
 @dataclass
@@ -51,8 +50,10 @@ class _Shutdown(_Delivery):
         self.handle = None
         if state.invocation is self:
             # Runner.close() owns the loop and closes it in a finally block.
-            # Stop only that final shutdown, never a reusable runner invocation.
+            # Each shutdown phase can consume a stop, so keep stopping until
+            # close() returns. Never stop a reusable runner invocation.
             self.loop.stop()
+            self.handle = self.loop.call_soon(self.interrupt, state)
 
 
 _RUNNER_STATE = pytest.StashKey[_RunnerState]()
@@ -60,16 +61,10 @@ _T = TypeVar("_T")
 
 
 def configure(config: pytest.Config) -> None:
-    enabled = config.getoption("asyncio_cooperative_timeouts") or config.getini(
-        "asyncio_cooperative_timeouts"
-    )
-    if not enabled:
+    if sys.version_info < (3, 11):
         return
     if not config.hook.pytest_timeout_expired.has_spec():
-        raise pytest.UsageError(
-            "asyncio_cooperative_timeouts requires pytest-timeout's "
-            "pytest_timeout_expired hook"
-        )
+        return
     config.stash[_RUNNER_STATE] = _RunnerState()
 
 
@@ -92,6 +87,7 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
 
 @contextlib.contextmanager
 def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
+    __tracebackhide__ = True
     state = config.stash[_RUNNER_STATE]
     previous = state.invocation
     state.invocation = invocation
@@ -109,10 +105,8 @@ def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
     except asyncio.CancelledError as exc:
         if invocation.exception is None:
             raise
-        if invocation.timeout_cancellation:
-            raise invocation.exception from exc
-        # Preserve cancellation when another caller requested it, or when a
-        # custom Task cannot tell us whose cancellation is being delivered.
+        # asyncio.Timeout converts only its own cancellation to TimeoutError.
+        # Preserve cancellation requested by another caller.
         raise exc from invocation.exception
     except BaseException as exc:
         if invocation.exception is None or exc is invocation.exception:
@@ -129,45 +123,39 @@ def run(
     context: contextvars.Context,
     config: pytest.Config,
 ) -> _T:
+    __tracebackhide__ = True
     if _RUNNER_STATE not in config.stash:
         return runner.run(coro, context=context)
 
     invocation = _Invocation(runner.get_loop())
 
     async def invoke() -> _T:
-        task = asyncio.current_task()
-        assert task is not None
-        invocation.task = task
+        __tracebackhide__ = True
+        invocation.started = True
         if invocation.exception is not None:
             coro.close()
             raise invocation.exception
-        # A custom Python 3.10 task factory can bypass the runner backport's
-        # Task, which provides the cancellation-count methods added in 3.11.
-        get_cancelling = getattr(task, "cancelling", None)
-        uncancel = getattr(task, "uncancel", None)
-        cancelling = get_cancelling() if get_cancelling is not None else 0
         try:
-            return await coro
+            async with asyncio.timeout(None) as timeout:
+                invocation.timeout = timeout
+                return await coro
         finally:
-            if invocation.cancellation_requested and uncancel is not None:
-                # Remove only our cancellation before Runner handles SIGINT.
-                # A concurrent external cancellation must still propagate.
-                remaining = uncancel()
-                invocation.timeout_cancellation = (
-                    get_cancelling is not None and remaining <= cancelling
-                )
+            # The signal may have queued delivery just as the coroutine exits.
+            # Do not reschedule a timeout whose context has already exited.
+            invocation.timeout = None
 
     wrapped = invoke()
     try:
         with _deliver(config, invocation):
             return runner.run(wrapped, context=context)
     finally:
-        if invocation.task is None:
+        if not invocation.started:
             wrapped.close()
             coro.close()
 
 
 def close(runner: Runner, *, config: pytest.Config) -> None:
+    __tracebackhide__ = True
     if _RUNNER_STATE not in config.stash:
         runner.close()
         return
