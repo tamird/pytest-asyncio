@@ -41,20 +41,31 @@ def test_runner_timeout_delivery(pytester: Pytester, cooperative_timeout: None):
         import contextvars
         import inspect
         import signal
+        import sys
+        from collections.abc import Coroutine
         import pytest
         from conftest import failures
         from pytest_asyncio._timeout import run
 
         pytestmark = pytest.mark.timeout(10, method="signal", func_only=True)
 
-        @pytest.mark.parametrize("startup", ["timeout", "error"])
-        def test_startup(startup, request):
+        @pytest.mark.parametrize("startup", [
+            "timeout", "error", "interrupt_before_start", "interrupt_during_timeout",
+            "interrupt_after_start", "custom_coroutine",
+        ])
+        def test_startup(startup, request, monkeypatch):
             entered = []
             wrappers = []
+            tasks = []
             failure = ValueError("task creation failed")
 
             async def body():
                 entered.append(True)
+                if startup == "interrupt_after_start":
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        raise failure
 
             async def later():
                 return 42
@@ -67,27 +78,94 @@ def test_runner_timeout_delivery(pytester: Pytester, cooperative_timeout: None):
                     wrappers.append(coro)
                     if startup == "error":
                         raise failure
-                    signal.raise_signal(signal.SIGALRM)
-                    return loop.create_task(coro, **kwargs)
+                    if startup == "timeout":
+                        signal.raise_signal(signal.SIGALRM)
+                    task = loop.create_task(coro, **kwargs)
+                    tasks.append(task)
+                    if startup == "custom_coroutine":
+                        raise failure
+                    return task
+
+                if startup in ("interrupt_before_start", "interrupt_during_timeout"):
+                    target, name = (
+                        (loop, "run_until_complete")
+                        if startup == "interrupt_before_start"
+                        else (asyncio, "timeout")
+                    )
+                    original = getattr(target, name)
+
+                    def interrupt(*args, **kwargs):
+                        monkeypatch.setattr(target, name, original)
+                        signal.raise_signal(signal.SIGINT)
+                        signal.raise_signal(signal.SIGINT)
+                        return original(*args, **kwargs)
+
+                    monkeypatch.setattr(target, name, interrupt)
 
                 loop.set_task_factory(task_factory)
                 coro = body()
-                expected = ValueError if startup == "error" else pytest.fail.Exception
-                with pytest.raises(expected) as caught:
-                    run(
-                        runner, coro, context=contextvars.copy_context(),
-                        config=request.config,
+                argument = coro
+                if startup == "custom_coroutine":
+                    class CustomCoroutine(Coroutine):
+                        def send(self, value):
+                            return coro.send(value)
+
+                        def throw(self, *args):
+                            return coro.throw(*args)
+
+                        def __await__(self):
+                            return coro.__await__()
+
+                    argument = CustomCoroutine()
+
+                original_trace = sys.gettrace()
+                if startup == "interrupt_after_start":
+                    def trace(frame, event, arg):
+                        if (
+                            wrappers and frame.f_code is wrappers[0].cr_code
+                            and event == "return" and arg is not None
+                        ):
+                            sys.settrace(None)
+                            signal.raise_signal(signal.SIGINT)
+                            signal.raise_signal(signal.SIGINT)
+                        return trace
+
+                    sys.settrace(trace)
+
+                expected = {
+                    "timeout": pytest.fail.Exception, "error": ValueError,
+                    "custom_coroutine": ValueError,
+                }.get(startup, KeyboardInterrupt)
+                try:
+                    with pytest.raises(expected) as caught:
+                        run(
+                            runner, argument, context=contextvars.copy_context(),
+                            config=request.config,
+                        )
+                finally:
+                    sys.settrace(original_trace)
+                if startup in ("timeout", "error", "custom_coroutine"):
+                    assert caught.value is (
+                        failures[-1] if startup == "timeout" else failure
                     )
-                assert caught.value is (failure if startup == "error" else failures[-1])
-                assert not entered
-                assert all(
-                    inspect.getcoroutinestate(c) == inspect.CORO_CLOSED
-                    for c in [coro, *wrappers]
-                )
-                assert run(
-                    runner, later(), context=contextvars.copy_context(),
-                    config=request.config,
-                ) == 42
+                if startup == "interrupt_after_start":
+                    with pytest.raises(ValueError) as cleanup:
+                        coro.close()
+                    assert cleanup.value is failure
+                if startup != "custom_coroutine":
+                    assert run(
+                        runner, later(), context=contextvars.copy_context(),
+                        config=request.config,
+                    ) == 42
+            assert bool(entered) is (startup == "interrupt_after_start")
+            assert all(
+                inspect.getcoroutinestate(c) == inspect.CORO_CLOSED
+                for c in [coro, *wrappers] if inspect.iscoroutine(c)
+            )
+            if startup in ("interrupt_before_start", "custom_coroutine"):
+                assert tasks[0].cancelled()
+            elif startup in ("interrupt_during_timeout", "interrupt_after_start"):
+                assert tasks[0].exception() is caught.value
 
         @pytest.mark.parametrize(
             "cleanup",
@@ -139,7 +217,7 @@ def test_runner_timeout_delivery(pytester: Pytester, cooperative_timeout: None):
                 assert caught.value is failures[-1]
         """))
     result = pytester.runpytest_subprocess(timeout=10)
-    result.assert_outcomes(passed=9)
+    result.assert_outcomes(passed=13)
     assert "was never awaited" not in result.stdout.str() + result.stderr.str()
 
 

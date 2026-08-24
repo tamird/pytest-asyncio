@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import inspect
 import sys
 import threading
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
+from types import CoroutineType
 from typing import Any, TypeVar
 
 import pytest
@@ -24,7 +26,6 @@ class _Delivery:
     closing: bool = False
     exception: BaseException | None = None
     timeout: asyncio.Timeout | None = None
-    started: bool = False
 
     def interrupt(self, state: _RunnerState) -> None:
         if state.invocation is not self:
@@ -104,16 +105,14 @@ def run(
     config: pytest.Config,
 ) -> _T:
     __tracebackhide__ = True
-    if _RUNNER_STATE not in config.stash:
+    if _RUNNER_STATE not in config.stash or not isinstance(coro, CoroutineType):
         return runner.run(coro, context=context)
 
     invocation = _Delivery(runner.get_loop())
 
     async def invoke() -> _T:
         __tracebackhide__ = True
-        invocation.started = True
         if invocation.exception is not None:
-            coro.close()
             raise invocation.exception
         try:
             async with asyncio.timeout(None) as timeout:
@@ -128,10 +127,22 @@ def run(
     try:
         with _deliver(config, invocation):
             return runner.run(wrapped, context=context)
-    finally:
-        if not invocation.started:
-            wrapped.close()
-            coro.close()
+    except BaseException:
+
+        def close_unstarted(_task: asyncio.Future[Any] | None = None) -> None:
+            # Never run suspended user cleanup outside its task.
+            for coroutine in (wrapped, coro):
+                if inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
+                    coroutine.close()
+
+        # A task can own the wrapper without having started it.
+        for task in asyncio.all_tasks(invocation.loop):
+            if task.get_coro() is wrapped:
+                task.add_done_callback(close_unstarted)
+                break
+        else:
+            close_unstarted()
+        raise
 
 
 def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
