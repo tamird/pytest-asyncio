@@ -13,11 +13,6 @@ from typing import Any, TypeVar
 
 import pytest
 
-if sys.version_info >= (3, 11):
-    from asyncio import Runner
-else:
-    from backports.asyncio.runner import Runner
-
 
 class _RunnerState(threading.local):
     invocation: _Delivery | None = None
@@ -39,15 +34,12 @@ class _Invocation(_Delivery):
     started: bool = False
 
     def interrupt(self, state: _RunnerState) -> None:
-        self.handle = None
         if state.invocation is self and self.timeout is not None:
             self.timeout.reschedule(self.loop.time())
 
 
-@dataclass
 class _Shutdown(_Delivery):
     def interrupt(self, state: _RunnerState) -> None:
-        self.handle = None
         if state.invocation is self:
             # Runner.close() owns the loop and closes it in a finally block.
             # Each shutdown phase can consume a stop, so keep stopping until
@@ -78,6 +70,8 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
         invocation.exception = exception
         # Raising here can interrupt asyncio before it schedules a task's next
         # step. Return to the interrupted code and cancel at a safe loop turn.
+        # A signal can interrupt before the returned handle is saved, so the
+        # callback must also check that this invocation is still active.
         if not invocation.loop.is_closed():
             invocation.handle = invocation.loop.call_soon_threadsafe(
                 invocation.interrupt, state
@@ -117,7 +111,7 @@ def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
 
 
 def run(
-    runner: Runner,
+    runner: asyncio.Runner,
     coro: Coroutine[Any, Any, _T],
     *,
     context: contextvars.Context,
@@ -154,7 +148,7 @@ def run(
             coro.close()
 
 
-def close(runner: Runner, *, config: pytest.Config) -> None:
+def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
     __tracebackhide__ = True
     if _RUNNER_STATE not in config.stash:
         runner.close()

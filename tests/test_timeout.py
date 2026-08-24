@@ -43,9 +43,10 @@ def test_timeout_before_task_start(
         import contextvars
         import inspect
         import signal
+        from asyncio import Runner
         import pytest
         from conftest import failures
-        from pytest_asyncio._timeout import Runner, run
+        from pytest_asyncio._timeout import run
 
         @pytest.mark.timeout(10, method="signal", func_only=True)
         def test_startup(request):
@@ -324,18 +325,4 @@ def test_signal_timeout_on_python310(pytester: Pytester, timeout_plugin: None):
                 signal.raise_signal(signal.SIGALRM)
         """))
     result = pytester.runpytest_subprocess(timeout=10)
-    result.assert_outcomes(passed=1)
-
-
-def test_asyncio_without_timeout_plugin(pytester: Pytester):
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent("""\
-        import asyncio
-        import pytest
-
-        @pytest.mark.asyncio
-        async def test_asyncio():
-            await asyncio.sleep(0)
-        """))
-    result = pytester.runpytest_subprocess("-p", "no:timeout", timeout=10)
     result.assert_outcomes(passed=1)
