@@ -3,39 +3,67 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import contextvars
 import sys
 import threading
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import pytest
 
+__tracebackhide__ = True
+_T = TypeVar("_T")
+
 
 @dataclass
 class _Delivery:
+    config: pytest.Config
     loop: asyncio.AbstractEventLoop
     closing: bool = False
     exception: BaseException | None = None
     timeout: asyncio.Timeout | None = None
 
-    def interrupt(self, config: pytest.Config) -> None:
-        if config.stash.get(_CURRENT_DELIVERY, None) is not self:
+    def run(self, operation: Callable[[], _T]) -> _T:
+        previous = self.config.stash.get(_CURRENT_DELIVERY, None)
+        try:
+            try:
+                self.config.stash[_CURRENT_DELIVERY] = self
+                result = operation()
+            finally:
+                # Once the runner returns, a new signal can fail synchronously.
+                # Stop claiming it before deciding which outcome to propagate.
+                self.config.stash[_CURRENT_DELIVERY] = previous
+        except (KeyboardInterrupt, SystemExit, pytest.exit.Exception):
+            raise
+        except asyncio.CancelledError as exc:
+            if self.exception is None:
+                raise
+            # asyncio.Timeout converts only its own cancellation to TimeoutError.
+            # Preserve cancellation requested by another caller.
+            raise exc from self.exception
+        except BaseException as exc:
+            if self.exception is None or exc is self.exception:
+                raise
+            raise self.exception from exc
+        if self.exception is not None:
+            raise self.exception
+        return result
+
+    def interrupt(self) -> None:
+        if self.config.stash.get(_CURRENT_DELIVERY, None) is not self:
             return
         if self.closing:
             # A completed shutdown phase can consume stop(). Keep stopping
             # until Runner.close() returns; never stop a reusable invocation.
             self.loop.stop()
-            self.loop.call_soon(self.interrupt, config)
+            self.loop.call_soon(self.interrupt)
         elif self.timeout is not None:
             self.timeout.reschedule(self.loop.time())
 
 
 # SIGALRM only reaches the main thread; worker runners keep their native behavior.
 _CURRENT_DELIVERY = pytest.StashKey[_Delivery | None]()
-_T = TypeVar("_T")
 
 
 def _supports_cooperative_timeouts(config: pytest.Config) -> bool:
@@ -61,36 +89,8 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
         # Late callbacks check ownership instead of relying on Handle.cancel():
         # SIGINT can interrupt scheduling before the handle is returned.
         if not invocation.loop.is_closed():
-            invocation.loop.call_soon_threadsafe(invocation.interrupt, item.config)
+            invocation.loop.call_soon_threadsafe(invocation.interrupt)
     return True
-
-
-@contextlib.contextmanager
-def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
-    __tracebackhide__ = True
-    previous = config.stash.get(_CURRENT_DELIVERY, None)
-    try:
-        try:
-            config.stash[_CURRENT_DELIVERY] = invocation
-            yield
-        finally:
-            # Once the runner returns, a new signal can fail synchronously.
-            # Stop claiming it before deciding which outcome to propagate.
-            config.stash[_CURRENT_DELIVERY] = previous
-    except (KeyboardInterrupt, SystemExit, pytest.exit.Exception):
-        raise
-    except asyncio.CancelledError as exc:
-        if invocation.exception is None:
-            raise
-        # asyncio.Timeout converts only its own cancellation to TimeoutError.
-        # Preserve cancellation requested by another caller.
-        raise exc from invocation.exception
-    except BaseException as exc:
-        if invocation.exception is None or exc is invocation.exception:
-            raise
-        raise invocation.exception from exc
-    if invocation.exception is not None:
-        raise invocation.exception
 
 
 def run(
@@ -101,14 +101,12 @@ def run(
     config: pytest.Config,
 ) -> _T:
     """Run a native coroutine factory with cooperative timeout delivery."""
-    __tracebackhide__ = True
     if not _supports_cooperative_timeouts(config):
         return runner.run(coro_factory(), context=context)
 
-    invocation = _Delivery(runner.get_loop())
+    invocation = _Delivery(config, runner.get_loop())
 
     async def invoke() -> _T:
-        __tracebackhide__ = True
         if invocation.exception is not None:
             raise invocation.exception
         try:
@@ -122,14 +120,11 @@ def run(
             # Do not reschedule a timeout whose context has already exited.
             invocation.timeout = None
 
-    with _deliver(config, invocation):
-        return runner.run(invoke(), context=context)
+    return invocation.run(lambda: runner.run(invoke(), context=context))
 
 
 def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
-    __tracebackhide__ = True
     if not _supports_cooperative_timeouts(config):
         runner.close()
         return
-    with _deliver(config, _Delivery(runner.get_loop(), closing=True)):
-        runner.close()
+    _Delivery(config, runner.get_loop(), closing=True).run(runner.close)
