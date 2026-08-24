@@ -26,198 +26,152 @@ def cooperative_timeout(timeout_plugin: None):
 
 def test_runner_timeout_delivery(pytester: Pytester, cooperative_timeout: None):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent("""\
-        import pytest
-
-        failures = []
-
-        @pytest.hookimpl(wrapper=True)
-        def pytest_timeout_expired(item, exception):
-            failures.append(exception)
-            return (yield)
-        """))
     pytester.makepyfile(dedent("""\
         import asyncio
         import contextvars
+        import functools
         import inspect
         import signal
-        import sys
-        from collections.abc import Coroutine
         import pytest
-        from conftest import failures
-        from pytest_asyncio._timeout import run
+        from pytest_asyncio._timeout import pytest_timeout_expired, run
+        from pytest_asyncio.plugin import _synchronize_coroutine
 
-        pytestmark = pytest.mark.timeout(10, method="signal", func_only=True)
-
-        @pytest.mark.parametrize("startup", [
-            "timeout", "error", "interrupt_before_start", "interrupt_during_timeout",
-            "interrupt_after_start", "custom_coroutine",
-        ])
-        def test_startup(startup, request, monkeypatch):
+        @pytest.mark.parametrize("event", ["timeout", "interrupt"])
+        def test_startup(event, request):
+            expired = pytest.fail.Exception("original timeout")
             entered = []
-            wrappers = []
             tasks = []
-            failure = ValueError("task creation failed")
 
             async def body():
                 entered.append(True)
-                if startup == "interrupt_after_start":
-                    try:
-                        await asyncio.Future()
-                    finally:
-                        raise failure
-
-            async def later():
                 return 42
 
+            def task_factory(loop, coro, **kwargs):
+                loop.set_task_factory(None)
+
+                async def traced():
+                    return await coro
+
+                task = loop.create_task(traced(), **kwargs)
+                tasks.append(task)
+                if event == "interrupt":
+                    signal.raise_signal(signal.SIGINT)
+                pytest_timeout_expired(request.node, expired)
+                return task
+
             with asyncio.Runner() as runner:
-                loop = runner.get_loop()
-
-                def task_factory(loop, coro, **kwargs):
-                    loop.set_task_factory(None)
-                    wrappers.append(coro)
-                    if startup == "error":
-                        raise failure
-                    if startup == "timeout":
-                        signal.raise_signal(signal.SIGALRM)
-                    task = loop.create_task(coro, **kwargs)
-                    tasks.append(task)
-                    if startup == "custom_coroutine":
-                        raise failure
-                    return task
-
-                if startup in ("interrupt_before_start", "interrupt_during_timeout"):
-                    target, name = (
-                        (loop, "run_until_complete")
-                        if startup == "interrupt_before_start"
-                        else (asyncio, "timeout")
-                    )
-                    original = getattr(target, name)
-
-                    def interrupt(*args, **kwargs):
-                        monkeypatch.setattr(target, name, original)
-                        signal.raise_signal(signal.SIGINT)
-                        signal.raise_signal(signal.SIGINT)
-                        return original(*args, **kwargs)
-
-                    monkeypatch.setattr(target, name, interrupt)
-
-                loop.set_task_factory(task_factory)
-                coro = body()
-                argument = coro
-                if startup == "custom_coroutine":
-                    class CustomCoroutine(Coroutine):
-                        def send(self, value):
-                            return coro.send(value)
-
-                        def throw(self, *args):
-                            return coro.throw(*args)
-
-                        def __await__(self):
-                            return coro.__await__()
-
-                    argument = CustomCoroutine()
-
-                original_trace = sys.gettrace()
-                if startup == "interrupt_after_start":
-                    def trace(frame, event, arg):
-                        if (
-                            wrappers and frame.f_code is wrappers[0].cr_code
-                            and event == "return" and arg is not None
-                        ):
-                            sys.settrace(None)
-                            signal.raise_signal(signal.SIGINT)
-                            signal.raise_signal(signal.SIGINT)
-                        return trace
-
-                    sys.settrace(trace)
-
-                expected = {
-                    "timeout": pytest.fail.Exception, "error": ValueError,
-                    "custom_coroutine": ValueError,
-                }.get(startup, KeyboardInterrupt)
-                try:
-                    with pytest.raises(expected) as caught:
-                        run(
-                            runner, argument, context=contextvars.copy_context(),
-                            config=request.config,
-                        )
-                finally:
-                    sys.settrace(original_trace)
-                if startup in ("timeout", "error", "custom_coroutine"):
-                    assert caught.value is (
-                        failures[-1] if startup == "timeout" else failure
-                    )
-                if startup == "interrupt_after_start":
-                    with pytest.raises(ValueError) as cleanup:
-                        coro.close()
-                    assert cleanup.value is failure
-                if startup != "custom_coroutine":
-                    assert run(
-                        runner, later(), context=contextvars.copy_context(),
+                runner.get_loop().set_task_factory(task_factory)
+                expected = KeyboardInterrupt if event == "interrupt" else type(expired)
+                with pytest.raises(expected) as caught:
+                    run(
+                        runner, body, context=contextvars.copy_context(),
                         config=request.config,
-                    ) == 42
-            assert bool(entered) is (startup == "interrupt_after_start")
-            assert all(
-                inspect.getcoroutinestate(c) == inspect.CORO_CLOSED
-                for c in [coro, *wrappers] if inspect.iscoroutine(c)
-            )
-            if startup in ("interrupt_before_start", "custom_coroutine"):
-                assert tasks[0].cancelled()
-            elif startup in ("interrupt_during_timeout", "interrupt_after_start"):
-                assert tasks[0].exception() is caught.value
+                    )
+                if event == "interrupt":
+                    runner.run(asyncio.sleep(0))
+                    assert tasks[0].result() == 42
+                else:
+                    assert caught.value is expired
+                    assert not entered
+
+        @pytest.mark.parametrize("kind", ["native", "synchronous", "partial_subclass"])
+        def test_creator_context(kind, request):
+            value = contextvars.ContextVar("value", default="caller")
+            events = []
+            expired = pytest.fail.Exception("original timeout")
+
+            class Owner:
+                async def body(self, argument):
+                    events.append(("body", value.get(), argument))
+                    value.set("updated")
+                    if kind == "native":
+                        pytest_timeout_expired(request.node, expired)
+
+            native = functools.partial(Owner().body)
+
+            def creator(argument):
+                events.append(("creator", value.get()))
+                return native(argument)
+
+            if hasattr(inspect, "markcoroutinefunction"):
+                inspect.markcoroutinefunction(creator)
+
+            class SyncPartial(functools.partial):
+                def __call__(self, argument):
+                    events.append(("creator", value.get()))
+                    return super().__call__(argument)
+
+            func = {
+                "native": native,
+                "synchronous": creator,
+                "partial_subclass": SyncPartial(native),
+            }[kind]
+            context = contextvars.copy_context()
+            context.run(value.set, "task")
+            with asyncio.Runner() as runner:
+                synchronized = _synchronize_coroutine(
+                    func, runner, context, request.config
+                )
+                if kind == "native":
+                    with pytest.raises(type(expired)) as caught:
+                        synchronized(42)
+                    assert caught.value is expired
+                else:
+                    synchronized(42)
+            expected = [("body", "task", 42)]
+            if kind != "native":
+                expected.insert(0, ("creator", "caller"))
+            assert events == expected
+            assert value.get() == "caller"
+            assert context.get(value) == "updated"
 
         @pytest.mark.parametrize(
-            "cleanup",
-            ["return", "xfail", "error", "interrupt", "exit", "system_exit", "cancel"],
+            ("cleanup", "expected"),
+            [
+                (None, pytest.fail.Exception),
+                (pytest.xfail.Exception("cleanup xfail"), pytest.fail.Exception),
+                (ValueError("cleanup error"), pytest.fail.Exception),
+                ("interrupt", KeyboardInterrupt),
+                (
+                    pytest.exit.Exception("requested exit", returncode=4),
+                    pytest.exit.Exception,
+                ),
+                (SystemExit(7), SystemExit),
+                ("cancel", asyncio.CancelledError),
+            ],
         )
-        def test_cleanup(cleanup, request):
+        def test_cleanup(cleanup, expected, request):
+            expired = pytest.fail.Exception("original timeout")
+
             async def body():
                 loop = asyncio.get_running_loop()
-                loop.call_soon(signal.raise_signal, signal.SIGALRM)
+                loop.call_soon(pytest_timeout_expired, request.node, expired)
                 try:
                     await asyncio.Future()
                 except asyncio.CancelledError:
-                    if cleanup == "return":
-                        return
-                    if cleanup == "xfail":
-                        pytest.xfail("cleanup xfail")
-                    if cleanup == "error":
-                        raise ValueError("cleanup error")
-                    if cleanup == "exit":
-                        pytest.exit("requested exit", returncode=4)
-                    if cleanup == "system_exit":
-                        raise SystemExit(7)
-                    if cleanup == "cancel":
-                        asyncio.current_task().cancel()
-                    else:
+                    if cleanup == "interrupt":
                         signal.raise_signal(signal.SIGINT)
+                    elif cleanup == "cancel":
+                        asyncio.current_task().cancel()
+                    elif cleanup is not None:
+                        raise cleanup
                     await asyncio.sleep(0)
 
-            expected = {
-                "interrupt": KeyboardInterrupt,
-                "exit": pytest.exit.Exception,
-                "system_exit": SystemExit,
-                "cancel": asyncio.CancelledError,
-            }.get(cleanup, pytest.fail.Exception)
             with asyncio.Runner() as runner:
                 with pytest.raises(expected) as caught:
                     run(
-                        runner, body(), context=contextvars.copy_context(),
+                        runner, body, context=contextvars.copy_context(),
                         config=request.config,
                     )
             if cleanup == "cancel":
-                assert caught.value.__cause__ is failures[-1]
-            elif cleanup == "system_exit":
-                assert caught.value.code == 7
-            elif cleanup == "exit":
-                assert caught.value.returncode == 4
-                assert str(caught.value) == "requested exit"
+                assert caught.value.__cause__ is expired
             elif cleanup != "interrupt":
-                assert caught.value is failures[-1]
+                assert caught.value is (
+                    expired if expected is pytest.fail.Exception else cleanup
+                )
         """))
     result = pytester.runpytest_subprocess(timeout=10)
-    result.assert_outcomes(passed=13)
+    result.assert_outcomes(passed=12)
     assert "was never awaited" not in result.stdout.str() + result.stderr.str()
 
 
@@ -302,12 +256,8 @@ def test_timeout_during_async_cleanup(pytester: Pytester, cooperative_timeout: N
         import pytest_asyncio
 
         executor = None
+        worker = None
         release = threading.Event()
-        finished = threading.Event()
-
-        def worker():
-            release.wait(5)
-            finished.set()
 
         async def timeout():
             asyncio.get_running_loop().call_soon(signal.raise_signal, signal.SIGALRM)
@@ -342,7 +292,7 @@ def test_timeout_during_async_cleanup(pytester: Pytester, cooperative_timeout: N
         @pytest.mark.timeout(10, method="signal")
         @pytest.mark.asyncio
         async def test_timeout(phase, coroutine, fixture):
-            global executor
+            global executor, worker
             if phase == "shutdown":
                 asyncio.create_task(background())
                 await asyncio.sleep(0)
@@ -350,7 +300,7 @@ def test_timeout_during_async_cleanup(pytester: Pytester, cooperative_timeout: N
                 loop = asyncio.get_running_loop()
                 executor = ThreadPoolExecutor()
                 loop.set_default_executor(executor)
-                loop.run_in_executor(None, worker)
+                worker = executor.submit(release.wait, 5)
                 original = loop.shutdown_asyncgens
 
                 async def shutdown_asyncgens():
@@ -362,7 +312,7 @@ def test_timeout_during_async_cleanup(pytester: Pytester, cooperative_timeout: N
         def test_later():
             if executor is not None:
                 try:
-                    assert not finished.is_set()
+                    assert not worker.done()
                 finally:
                     release.set()
                     executor.shutdown(wait=True)

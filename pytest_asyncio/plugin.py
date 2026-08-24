@@ -412,7 +412,7 @@ def _wrap_asyncgen_fixture(
 
         context = contextvars.copy_context()
         result = _run_with_timeout(
-            runner, setup(), context=context, config=request.config
+            runner, setup, context=context, config=request.config
         )
 
         reset_contextvars = _apply_contextvar_changes(context)
@@ -431,7 +431,7 @@ def _wrap_asyncgen_fixture(
                     raise ValueError(msg)
 
             _run_with_timeout(
-                runner, async_finalizer(), context=context, config=request.config
+                runner, async_finalizer, context=context, config=request.config
             )
             if reset_contextvars is not None:
                 reset_contextvars()
@@ -464,7 +464,7 @@ def _wrap_async_fixture(
 
         context = contextvars.copy_context()
         result = _run_with_timeout(
-            runner, setup(), context=context, config=request.config
+            runner, setup, context=context, config=request.config
         )
 
         # Copy the context vars modified by the setup task into the current
@@ -902,6 +902,17 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     return None
 
 
+def _is_native_coroutine_function(func: object) -> bool:
+    # Partial subclasses can override __call__; binding them can discard it.
+    if type(func) is functools.partial:
+        return _is_native_coroutine_function(func.func)
+    if inspect.ismethod(func):
+        return _is_native_coroutine_function(func.__func__)
+    return inspect.isfunction(func) and bool(
+        func.__code__.co_flags & inspect.CO_COROUTINE
+    )
+
+
 def _synchronize_coroutine(
     func: Callable[..., CoroutineType],
     runner: asyncio.Runner,
@@ -915,8 +926,17 @@ def _synchronize_coroutine(
 
     @functools.wraps(func)
     def inner(*args, **kwargs):
-        coro = func(*args, **kwargs)
-        _run_with_timeout(runner, coro, context=context, config=config)
+        if not _is_native_coroutine_function(func):
+            # Synchronous creators must run in the caller's context, even when
+            # inspect.markcoroutinefunction() marks them as coroutine functions.
+            runner.run(func(*args, **kwargs), context=context)
+            return
+        _run_with_timeout(
+            runner,
+            functools.partial(func, *args, **kwargs),
+            context=context,
+            config=config,
+        )
 
     return inner
 

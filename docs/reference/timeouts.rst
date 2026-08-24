@@ -7,9 +7,11 @@ signal failures by cancelling the active asynchronous test or fixture when
 pytest-timeout provides the ``pytest_timeout_expired`` hook. Cooperative cleanup
 can then run before pytest reports the original timeout. No configuration is
 needed. Python 3.10 and older pytest-timeout versions retain their existing
-signal behavior. Runner invocations with custom coroutine objects retain
-synchronous signal delivery; cooperative execution requires native coroutine
-objects created by ``async def`` functions.
+signal behavior. Cooperative test execution requires a native ``async def``
+function, bound method, or plain ``functools.partial`` of one. Synchronous
+coroutine creators, including functions marked with
+``inspect.markcoroutinefunction()`` and subclasses of ``functools.partial``,
+retain their existing call timing, context, and synchronous signal delivery.
 pytest-timeout still controls the configured duration, covered test phases,
 debugger detection, and timeout diagnostics.
 

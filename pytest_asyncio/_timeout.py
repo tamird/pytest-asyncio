@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import inspect
 import sys
 import threading
-from collections.abc import Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass
-from types import CoroutineType
 from typing import Any, TypeVar
 
 import pytest
@@ -96,16 +94,15 @@ def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
 
 def run(
     runner: asyncio.Runner,
-    coro: Coroutine[Any, Any, _T],
+    coro_factory: Callable[[], Coroutine[Any, Any, _T]],
     *,
     context: contextvars.Context,
     config: pytest.Config,
 ) -> _T:
+    """Run a native coroutine factory with cooperative timeout delivery."""
     __tracebackhide__ = True
-    if not _supports_cooperative_timeouts(config) or not isinstance(
-        coro, CoroutineType
-    ):
-        return runner.run(coro, context=context)
+    if not _supports_cooperative_timeouts(config):
+        return runner.run(coro_factory(), context=context)
 
     invocation = _Delivery(runner.get_loop())
 
@@ -116,32 +113,16 @@ def run(
         try:
             async with asyncio.timeout(None) as timeout:
                 invocation.timeout = timeout
-                return await coro
+                # Create the user coroutine only once its task owns execution.
+                # Runner and task factories retain ownership of invoke().
+                return await coro_factory()
         finally:
             # The signal may have queued delivery just as the coroutine exits.
             # Do not reschedule a timeout whose context has already exited.
             invocation.timeout = None
 
-    wrapped = invoke()
-    try:
-        with _deliver(config, invocation):
-            return runner.run(wrapped, context=context)
-    except BaseException:
-
-        def close_unstarted(_task: asyncio.Future[Any] | None = None) -> None:
-            # Never run suspended user cleanup outside its task.
-            for coroutine in (wrapped, coro):
-                if inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
-                    coroutine.close()
-
-        # A task can own the wrapper without having started it.
-        for task in asyncio.all_tasks(invocation.loop):
-            if task.get_coro() is wrapped:
-                task.add_done_callback(close_unstarted)
-                break
-        else:
-            close_unstarted()
-        raise
+    with _deliver(config, invocation):
+        return runner.run(invoke(), context=context)
 
 
 def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
