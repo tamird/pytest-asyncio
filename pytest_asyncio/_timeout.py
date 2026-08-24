@@ -21,31 +21,21 @@ class _RunnerState(threading.local):
 @dataclass
 class _Delivery:
     loop: asyncio.AbstractEventLoop
+    closing: bool = False
     exception: BaseException | None = None
-    handle: asyncio.Handle | None = None
-
-    def interrupt(self, state: _RunnerState) -> None:
-        raise NotImplementedError
-
-
-@dataclass
-class _Invocation(_Delivery):
     timeout: asyncio.Timeout | None = None
     started: bool = False
 
     def interrupt(self, state: _RunnerState) -> None:
-        if state.invocation is self and self.timeout is not None:
-            self.timeout.reschedule(self.loop.time())
-
-
-class _Shutdown(_Delivery):
-    def interrupt(self, state: _RunnerState) -> None:
-        if state.invocation is self:
-            # Runner.close() owns the loop and closes it in a finally block.
-            # Each shutdown phase can consume a stop, so keep stopping until
-            # close() returns. Never stop a reusable runner invocation.
+        if state.invocation is not self:
+            return
+        if self.closing:
+            # A completed shutdown phase can consume stop(). Keep stopping
+            # until Runner.close() returns; never stop a reusable invocation.
             self.loop.stop()
-            self.handle = self.loop.call_soon(self.interrupt, state)
+            self.loop.call_soon(self.interrupt, state)
+        elif self.timeout is not None:
+            self.timeout.reschedule(self.loop.time())
 
 
 _RUNNER_STATE = pytest.StashKey[_RunnerState]()
@@ -70,12 +60,10 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
         invocation.exception = exception
         # Raising here can interrupt asyncio before it schedules a task's next
         # step. Return to the interrupted code and cancel at a safe loop turn.
-        # A signal can interrupt before the returned handle is saved, so the
-        # callback must also check that this invocation is still active.
+        # Late callbacks check ownership instead of relying on Handle.cancel():
+        # SIGINT can interrupt scheduling before the handle is returned.
         if not invocation.loop.is_closed():
-            invocation.handle = invocation.loop.call_soon_threadsafe(
-                invocation.interrupt, state
-            )
+            invocation.loop.call_soon_threadsafe(invocation.interrupt, state)
     return True
 
 
@@ -92,8 +80,6 @@ def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
             # Once the runner returns, a new signal can fail synchronously.
             # Stop claiming it before deciding which outcome to propagate.
             state.invocation = previous
-            if invocation.handle is not None:
-                invocation.handle.cancel()
     except (KeyboardInterrupt, SystemExit, pytest.exit.Exception):
         raise
     except asyncio.CancelledError as exc:
@@ -121,7 +107,7 @@ def run(
     if _RUNNER_STATE not in config.stash:
         return runner.run(coro, context=context)
 
-    invocation = _Invocation(runner.get_loop())
+    invocation = _Delivery(runner.get_loop())
 
     async def invoke() -> _T:
         __tracebackhide__ = True
@@ -153,5 +139,5 @@ def close(runner: asyncio.Runner, *, config: pytest.Config) -> None:
     if _RUNNER_STATE not in config.stash:
         runner.close()
         return
-    with _deliver(config, _Shutdown(runner.get_loop())):
+    with _deliver(config, _Delivery(runner.get_loop(), closing=True)):
         runner.close()
