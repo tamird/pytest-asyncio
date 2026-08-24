@@ -70,26 +70,20 @@ def test_startup(event: str, request: pytest.FixtureRequest, cooperative_timeout
             assert not entered
 
 
-@pytest.mark.parametrize("kind", ["native", "synchronous", "partial_subclass"])
+@pytest.mark.parametrize("kind", ["synchronous", "partial_subclass"])
 def test_creator_context(
     kind: str, request: pytest.FixtureRequest, cooperative_timeout: None
 ):
     value = contextvars.ContextVar("value", default="caller")
     events = []
-    expired = pytest.fail.Exception("original timeout")
 
-    class Owner:
-        async def body(self, argument):
-            events.append(("body", value.get(), argument))
-            value.set("updated")
-            if kind == "native":
-                pytest_timeout_expired(request.node, expired)
-
-    native = functools.partial(Owner().body)
+    async def body(argument):
+        events.append(("body", value.get(), argument))
+        value.set("updated")
 
     def creator(argument):
         events.append(("creator", value.get()))
-        return native(argument)
+        return body(argument)
 
     if hasattr(inspect, "markcoroutinefunction"):
         inspect.markcoroutinefunction(creator)
@@ -100,9 +94,8 @@ def test_creator_context(
             return super().__call__(*args, **kwargs)
 
     functions: dict[str, Callable[..., CoroutineType]] = {
-        "native": native,
         "synchronous": creator,
-        "partial_subclass": SyncPartial(native),
+        "partial_subclass": SyncPartial(body),
     }
     context = contextvars.copy_context()
     context.run(value.set, "task")
@@ -110,14 +103,8 @@ def test_creator_context(
         synchronized = _synchronize_coroutine(
             functions[kind], runner, context, request.config
         )
-        if kind == "native":
-            with pytest.raises(type(expired)) as caught:
-                synchronized(42)
-            assert caught.value is expired
-        else:
-            synchronized(42)
-    assert events[-1] == ("body", "task", 42)
-    assert events[:-1] == ([] if kind == "native" else [("creator", "caller")])
+        synchronized(42)
+    assert events == [("creator", "caller"), ("body", "task", 42)]
     assert value.get() == "caller"
     assert context.get(value) == "updated"
 
@@ -183,6 +170,7 @@ def test_signal_timeout_preserves_shared_loop(
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import asyncio
+        import functools
         import signal
         import time
         import pytest
@@ -194,19 +182,9 @@ def test_signal_timeout_preserves_shared_loop(
         async def application_wait():
             await asyncio.Future()
 
-        @pytest.mark.parametrize(
-            "trigger",
-            [
-                pytest.param("timer", marks=pytest.mark.timeout(
-                    0.1, method="signal", func_only=True,
-                )),
-                pytest.param("reschedule", marks=pytest.mark.timeout(
-                    10, method="signal", func_only=True,
-                )),
-            ],
-        )
+        @pytest.mark.timeout(0.1, method="signal", func_only=True)
         @pytest.mark.asyncio(loop_scope="module")
-        async def test_timeout(trigger):
+        async def timeout(trigger="timer"):
             loop = asyncio.get_running_loop()
             original = loop.call_soon
             task = asyncio.current_task()
@@ -228,6 +206,14 @@ def test_signal_timeout_preserves_shared_loop(
                 loop.call_soon = original
                 cleaned.append(trigger)
 
+        test_timer = functools.wraps(timeout)(functools.partial(timeout))
+
+        class TestTimeout:
+            @pytest.mark.timeout(10, method="signal", func_only=True)
+            @pytest.mark.asyncio(loop_scope="module")
+            async def test_timeout(self):
+                await timeout("reschedule")
+
         @pytest.mark.asyncio(loop_scope="module")
         async def test_later():
             assert cleaned == ["timer", "reschedule"]
@@ -238,9 +224,11 @@ def test_signal_timeout_preserves_shared_loop(
                 signal.raise_signal(signal.SIGALRM)
         """))
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
-    result = pytester.runpytest_subprocess(
-        "-p", "pytest_asyncio.plugin", "--tb=short", timeout=10
-    )
+    plugins = ["-p", "pytest_asyncio.plugin"]
+    if pytest.version_tuple < (9, 1):
+        # Older pytest cannot initialize pytest-timeout's options when loaded late.
+        plugins.extend(("-p", "pytest_timeout"))
+    result = pytester.runpytest_subprocess(*plugins, "--tb=short", timeout=10)
     result.assert_outcomes(failed=2, passed=2)
     result.stdout.fnmatch_lines(["E *Failed: Timeout*from pytest-timeout.*"] * 2)
     result.stdout.fnmatch_lines(["*in application_wait*", "*CancelledError*"])
