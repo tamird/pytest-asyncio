@@ -14,10 +14,6 @@ from typing import Any, TypeVar
 import pytest
 
 
-class _RunnerState(threading.local):
-    invocation: _Delivery | None = None
-
-
 @dataclass
 class _Delivery:
     loop: asyncio.AbstractEventLoop
@@ -25,33 +21,39 @@ class _Delivery:
     exception: BaseException | None = None
     timeout: asyncio.Timeout | None = None
 
-    def interrupt(self, state: _RunnerState) -> None:
-        if state.invocation is not self:
+    def interrupt(self, config: pytest.Config) -> None:
+        if config.stash.get(_CURRENT_DELIVERY, None) is not self:
             return
         if self.closing:
             # A completed shutdown phase can consume stop(). Keep stopping
             # until Runner.close() returns; never stop a reusable invocation.
             self.loop.stop()
-            self.loop.call_soon(self.interrupt, state)
+            self.loop.call_soon(self.interrupt, config)
         elif self.timeout is not None:
             self.timeout.reschedule(self.loop.time())
 
 
-_RUNNER_STATE = pytest.StashKey[_RunnerState]()
+# SIGALRM only reaches the main thread; worker runners keep their native behavior.
+_CURRENT_DELIVERY = pytest.StashKey[_Delivery | None]()
 _T = TypeVar("_T")
 
 
 def _supports_cooperative_timeouts(config: pytest.Config) -> bool:
     # Test modules can load pytest-timeout after pytest_configure has run.
-    return sys.version_info >= (3, 11) and config.hook.pytest_timeout_expired.has_spec()
+    return (
+        sys.version_info >= (3, 11)
+        and threading.current_thread() is threading.main_thread()
+        and config.hook.pytest_timeout_expired.has_spec()
+    )
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
 def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool | None:
-    state = item.config.stash.get(_RUNNER_STATE, None)
-    if state is None or state.invocation is None:
+    if threading.current_thread() is not threading.main_thread():
         return None
-    invocation = state.invocation
+    invocation = item.config.stash.get(_CURRENT_DELIVERY, None)
+    if invocation is None:
+        return None
     if invocation.exception is None:
         invocation.exception = exception
         # Raising here can interrupt asyncio before it schedules a task's next
@@ -59,23 +61,22 @@ def pytest_timeout_expired(item: pytest.Item, exception: BaseException) -> bool 
         # Late callbacks check ownership instead of relying on Handle.cancel():
         # SIGINT can interrupt scheduling before the handle is returned.
         if not invocation.loop.is_closed():
-            invocation.loop.call_soon_threadsafe(invocation.interrupt, state)
+            invocation.loop.call_soon_threadsafe(invocation.interrupt, item.config)
     return True
 
 
 @contextlib.contextmanager
 def _deliver(config: pytest.Config, invocation: _Delivery) -> Iterator[None]:
     __tracebackhide__ = True
-    state = config.stash.setdefault(_RUNNER_STATE, _RunnerState())
-    previous = state.invocation
-    state.invocation = invocation
+    previous = config.stash.get(_CURRENT_DELIVERY, None)
     try:
         try:
+            config.stash[_CURRENT_DELIVERY] = invocation
             yield
         finally:
             # Once the runner returns, a new signal can fail synchronously.
             # Stop claiming it before deciding which outcome to propagate.
-            state.invocation = previous
+            config.stash[_CURRENT_DELIVERY] = previous
     except (KeyboardInterrupt, SystemExit, pytest.exit.Exception):
         raise
     except asyncio.CancelledError as exc:
